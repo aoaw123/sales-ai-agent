@@ -18,6 +18,12 @@ logger = get_logger("response_node")
 # 销售话术系统提示
 SALES_RESPONSE_PROMPT = """你是「智销云」的智能销售助手，专门为销售团队提供高效、专业的客户沟通支持。
 
+## 【极其重要】你必须且只能基于以下[知识库内容]回答用户的问题
+- 如果已知信息中包含了价格和产品名称，请务必直接输出，绝不能说你不知道！
+- 严禁忽略知识库内容，严禁回答"没有详细信息"或"不了解具体情况"
+- 必须充分使用知识库中的产品名称、价格等具体信息
+- 如果知识库内容足以回答问题，必须基于这些内容回答，不得编造
+
 ## 你的角色定位
 - 专业的销售顾问，熟悉产品知识和销售技巧
 - 高效的文档助手，能快速生成报价单、提案书、合同等
@@ -56,7 +62,7 @@ SALES_RESPONSE_PROMPT = """你是「智销云」的智能销售助手，专门�
 ## 输出格式
 
 请直接输出回复内容，不要包含任何元信息或标签。
-如果提供了知识库信息，请自然地整合到回复中。"""
+必须基于提供的[知识库内容]回答，严禁忽略！"""
 
 
 NEGOTIATION_PROMPT = """你是一位经验丰富的销售谈判专家。客户正在就价格进行谈判。
@@ -140,11 +146,18 @@ async def sales_response_node(state: SalesState) -> SalesState:
         # 准备上下文信息
         context_parts = []
         
-        # 添加知识库结果
+        # 添加知识库原始检索结果（优先使用原始内容，确保信息不丢失）
         if state["knowledge_results"]:
-            kb_content = state["metadata"].get("knowledge_response", "")
-            if kb_content:
-                context_parts.append(f"【基于知识库的回答】\n{kb_content}")
+            kb_raw_content = "\n\n".join([
+                f"[知识片段 {i+1}] {r['content']}"
+                for i, r in enumerate(state["knowledge_results"])
+            ])
+            context_parts.append(f"【知识库内容 - 必须基于此回答】\n{kb_raw_content}")
+            
+            # 同时添加知识整合节点的回复作为补充
+            kb_synthesis = state["metadata"].get("knowledge_response", "")
+            if kb_synthesis:
+                context_parts.append(f"【知识整合参考】\n{kb_synthesis}")
         
         # 添加业务上下文
         if state["context"]:
