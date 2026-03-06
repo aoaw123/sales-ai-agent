@@ -101,6 +101,30 @@ async def chat(
         # 计算响应时间
         response_time_ms = int((time.time() - start_time) * 1000)
         
+        # 多层防御性编程：确保 final_state 始终是字典
+        if final_state is None:
+            final_state = {}
+            logger.warning(f"[Session: {actual_session_id}] run_sales_agent 返回 None")
+        elif isinstance(final_state, tuple):
+            # 处理可能返回的元组 (state, config) 或空元组 ()
+            if len(final_state) > 0:
+                tuple_content = final_state[0]
+                # 如果内容是字典，使用它
+                if isinstance(tuple_content, dict):
+                    final_state = tuple_content
+                else:
+                    # 否则记录并返回空字典
+                    logger.warning(f"[Session: {actual_session_id}] 元组首元素不是字典: {type(tuple_content)}")
+                    final_state = {}
+            else:
+                # 空元组！这是 LangGraph interrupt 导致的
+                logger.error(f"[Session: {actual_session_id}] LangGraph 返回空元组，流程被中断")
+                final_state = {}
+        elif not isinstance(final_state, dict):
+            # 其他非预期类型
+            logger.warning(f"[Session: {actual_session_id}] final_state 是意外类型: {type(final_state)}")
+            final_state = {}
+        
         # 构建响应
         intent = final_state.get("intent_analysis")
         intent_value = intent.intent if intent else UserIntent.UNKNOWN

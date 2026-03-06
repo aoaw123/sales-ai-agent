@@ -6,11 +6,12 @@
  * - 左侧边栏显示历史会话和 Logo
  * - 右侧聊天区域（消息列表 + 输入框）
  * - 支持 Markdown 渲染
+ * - 支持文件下载（Excel 报价单等）
  * - 与 FastAPI 后端对接
  */
 
 import { useState, useRef, useEffect } from 'react';
-import type { Message, ChatRequest, ChatResponse } from './types';
+import type { Message, ChatRequest, ChatResponse, DocumentFile } from './types';
 import { 
   Send, 
   MessageSquare, 
@@ -20,64 +21,395 @@ import {
   Loader2,
   Trash2,
   Menu,
-  X
+  X,
+  Download,
+  FileText,
+  FileSpreadsheet
 } from 'lucide-react';
 
 /**
  * API 基础配置
  * BACKEND_URL: 后端服务地址
+ * DOCUMENTS_URL: 文件下载基础地址
  * SESSION_ID: 当前会话标识（实际应用中可动态生成或使用用户 ID）
  */
 const BACKEND_URL = 'http://127.0.0.1:8000/api/v1/chat';
+const DOCUMENTS_URL = 'http://127.0.0.1:8000/api/v1/docs/documents';
 const SESSION_ID = 'web_user_001';
+
+/**
+ * 安全的类型检查工具函数
+ */
+
+/** 检查值是否为非空字符串 */
+const isNonEmptyString = (value: unknown): value is string => {
+  return typeof value === 'string' && value.length > 0;
+};
+
+/** 检查值是否为有效的数组 */
+const isValidArray = <T,>(value: unknown): value is T[] => {
+  return Array.isArray(value) && value.length > 0;
+};
+
+/** 安全地获取字符串值，如果无效则返回默认值 */
+const safeString = (value: unknown, defaultValue = ''): string => {
+  return isNonEmptyString(value) ? value : defaultValue;
+};
 
 /**
  * 简单的 Markdown 渲染函数
  * 将 Markdown 文本转换为 HTML（简化版，支持常用语法）
+ * 添加了空值安全检查
  */
-const renderMarkdown = (text: string): string => {
-  let html = text
-    // 转义 HTML 特殊字符，防止 XSS
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    
-    // 代码块 (```code```)
-    .replace(/```([\s\S]*?)```/g, '<pre><code>$1</code></pre>')
-    
-    // 行内代码 (`code`)
-    .replace(/`([^`]+)`/g, '<code>$1</code>')
-    
-    // 标题 (# ## ###)
-    .replace(/^### (.*$)/gim, '<h3>$1</h3>')
-    .replace(/^## (.*$)/gim, '<h2>$1</h2>')
-    .replace(/^# (.*$)/gim, '<h1>$1</h1>')
-    
-    // 粗体 (**text**)
-    .replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>')
-    
-    // 斜体 (*text*)
-    .replace(/\*(.*?)\*/g, '<em>$1</em>')
-    
-    // 无序列表 (- item)
-    .replace(/^- (.*$)/gim, '<li>$1</li>')
-    
-    // 有序列表 (1. item)
-    .replace(/^\d+\. (.*$)/gim, '<li>$1</li>')
-    
-    // 链接 [text](url)
-    .replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>')
-    
-    // 引用 (> text)
-    .replace(/^&gt; (.*$)/gim, '<blockquote>$1</blockquote>')
-    
-    // 水平线 (---)
-    .replace(/^---$/gim, '<hr>')
-    
-    // 换行符处理
-    .replace(/\n/g, '<br>');
+const renderMarkdown = (text: unknown): string => {
+  // 防御性编程：确保输入是字符串
+  if (!isNonEmptyString(text)) {
+    return '';
+  }
   
-  return html;
+  try {
+    let html = text
+      // 转义 HTML 特殊字符，防止 XSS
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      
+      // 代码块 (```code```)
+      .replace(/```([\s\S]*?)```/g, '<pre><code>$1</code></pre>')
+      
+      // 行内代码 (`code`)
+      .replace(/`([^`]+)`/g, '<code>$1</code>')
+      
+      // 标题 (# ## ###)
+      .replace(/^### (.*$)/gim, '<h3>$1</h3>')
+      .replace(/^## (.*$)/gim, '<h2>$1</h2>')
+      .replace(/^# (.*$)/gim, '<h1>$1</h1>')
+      
+      // 粗体 (**text**)
+      .replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>')
+      
+      // 斜体 (*text*)
+      .replace(/\*(.*?)\*/g, '<em>$1</em>')
+      
+      // 无序列表 (- item)
+      .replace(/^- (.*$)/gim, '<li>$1</li>')
+      
+      // 有序列表 (1. item)
+      .replace(/^\d+\. (.*$)/gim, '<li>$1</li>')
+      
+      // 链接 [text](url)
+      .replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>')
+      
+      // 引用 (> text)
+      .replace(/^&gt; (.*$)/gim, '<blockquote>$1</blockquote>')
+      
+      // 水平线 (---)
+      .replace(/^---$/gim, '<hr>')
+      
+      // 换行符处理
+      .replace(/\n/g, '<br>');
+    
+    return html;
+  } catch (error) {
+    console.error('Markdown 渲染错误:', error);
+    // 如果渲染失败，返回转义后的原始文本
+    return isNonEmptyString(text) 
+      ? text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+      : '';
+  }
+};
+
+/**
+ * 从消息内容中提取文件名（备用方案）
+ * 匹配格式："报价单_xxx.xlsx" 或 "XXX.xlsx"
+ * 支持中文字符：\u4e00-\u9fa5 匹配常用汉字
+ * 添加了空值安全检查和 try-catch
+ */
+const extractFilenamesFromText = (text: unknown): string[] => {
+  // 防御性编程：确保输入是字符串
+  if (!isNonEmptyString(text)) {
+    return [];
+  }
+  
+  try {
+    const filenames: string[] = [];
+    
+    // 定义文件名中允许的字符：
+    // [\w\u4e00-\u9fa5-] = 英文字母数字下划线 + 中文字符 + 连字符
+    // 注意：\w 等价于 [A-Za-z0-9_]，不包含中文
+    const filenameChars = '[\\w\\u4e00-\u9fa5\\-]+';
+    
+    // 匹配常见的文件名格式（支持中文）
+    const patterns = [
+      // 匹配"报价单_xxx.xlsx"格式（支持中文前缀）
+      new RegExp(`报价单_${filenameChars}\\.(xlsx|xls|pdf|doc|docx)`, 'gi'),
+      // 匹配"xxx_20260101_120000.xlsx"格式（支持中文主体）
+      new RegExp(`${filenameChars}_\\d{8}_\\d{6}\\.(xlsx|xls|pdf|doc|docx)`, 'gi'),
+      // 通用匹配：任意由中文、英文、数字、下划线、连字符组成的文件名
+      new RegExp(`\\b${filenameChars}\\.(xlsx|xls|pdf|doc|docx)\\b`, 'gi')
+    ];
+    
+    for (const pattern of patterns) {
+      const matches = text.match(pattern);
+      if (matches && Array.isArray(matches)) {
+        filenames.push(...matches);
+      }
+    }
+    
+    // 严格去重：使用 Set 去除完全相同的文件名
+    // 同时过滤掉可能是部分匹配的空字符串或无效名称
+    const uniqueFilenames = Array.from(new Set(filenames))
+      .filter(name => isNonEmptyString(name) && name.includes('.'));
+    
+    // 额外去重：如果一个文件名是另一个文件名的子串，保留较长的那个
+    // 例如：如果同时匹配到 "报价单_客户.xlsx" 和 "客户.xlsx"，保留完整的 "报价单_客户.xlsx"
+    const cleanedFilenames: string[] = [];
+    for (const name of uniqueFilenames) {
+      // 检查是否已经被更长的文件名包含
+      const isSubstring = uniqueFilenames.some(other => 
+        other !== name && other.includes(name)
+      );
+      if (!isSubstring) {
+        cleanedFilenames.push(name);
+      }
+    }
+    
+    return cleanedFilenames;
+  } catch (error) {
+    console.error('提取文件名时出错:', error);
+    return [];
+  }
+};
+
+/**
+ * 获取文件图标组件
+ * 添加了空值安全检查
+ */
+const getFileIcon = (filename: unknown) => {
+  // 防御性编程：确保文件名是有效字符串
+  if (!isNonEmptyString(filename)) {
+    return <FileText className="w-5 h-5 text-gray-400" />;
+  }
+  
+  try {
+    const extension = filename.split('.').pop()?.toLowerCase();
+    switch (extension) {
+      case 'xlsx':
+      case 'xls':
+        return <FileSpreadsheet className="w-5 h-5 text-green-400" />;
+      case 'pdf':
+        return <FileText className="w-5 h-5 text-red-400" />;
+      case 'doc':
+      case 'docx':
+        return <FileText className="w-5 h-5 text-blue-400" />;
+      default:
+        return <FileText className="w-5 h-5 text-gray-400" />;
+    }
+  } catch (error) {
+    console.error('获取文件图标时出错:', error);
+    return <FileText className="w-5 h-5 text-gray-400" />;
+  }
+};
+
+/**
+ * 安全地处理文档列表
+ * 将各种可能的输入格式转换为标准化的 DocumentFile 数组
+ */
+const normalizeDocuments = (documents: unknown): DocumentFile[] | undefined => {
+  // 如果不是数组，直接返回 undefined
+  if (!Array.isArray(documents)) {
+    return undefined;
+  }
+  
+  // 过滤并映射为有效的 DocumentFile 对象
+  const validDocs = documents
+    .filter((doc): doc is { filename?: unknown } => {
+      // 确保每个元素是对象且有 filename 属性
+      return doc !== null && typeof doc === 'object' && 'filename' in doc;
+    })
+    .map((doc) => ({
+      filename: safeString(doc.filename)
+    }))
+    .filter((doc) => doc.filename.length > 0); // 过滤掉空文件名的
+  
+  return validDocs.length > 0 ? validDocs : undefined;
+};
+
+/**
+ * 文件下载卡片组件
+ * 独立的组件便于管理和错误隔离
+ */
+interface FileDownloadCardProps {
+  filename: string;
+  onDownload: (filename: string) => void;
+  index: number;
+}
+
+const FileDownloadCard: React.FC<FileDownloadCardProps> = ({ filename, onDownload, index }) => {
+  // 防御性编程：如果文件名无效，不渲染任何内容
+  if (!isNonEmptyString(filename)) {
+    return null;
+  }
+  
+  return (
+    <div
+      key={index}
+      onClick={() => onDownload(filename)}
+      className="group relative overflow-hidden cursor-pointer"
+    >
+      {/* 主卡片容器 */}
+      <div className="relative flex items-center gap-3 px-4 py-3 
+                      bg-gradient-to-r from-slate-900 via-slate-800 to-slate-900
+                      border border-cyan-500/30 rounded-xl
+                      shadow-[0_0_20px_rgba(6,182,212,0.15)]
+                      hover:shadow-[0_0_30px_rgba(6,182,212,0.3)]
+                      hover:border-cyan-400/50
+                      transition-all duration-300 ease-out
+                      transform hover:scale-[1.02]
+                      min-w-[240px]">
+        
+        {/* 发光边框效果 */}
+        <div className="absolute inset-0 rounded-xl bg-gradient-to-r from-cyan-500/10 via-purple-500/10 to-cyan-500/10 opacity-0 group-hover:opacity-100 transition-opacity duration-500" />
+        
+        {/* 左侧文件图标 */}
+        <div className="relative flex-shrink-0 w-10 h-10 
+                        flex items-center justify-center
+                        rounded-lg bg-gradient-to-br from-cyan-500/20 to-purple-500/20
+                        border border-cyan-400/30
+                        group-hover:from-cyan-500/30 group-hover:to-purple-500/30
+                        transition-all duration-300">
+          {getFileIcon(filename)}
+        </div>
+        
+        {/* 中间文件名信息 */}
+        <div className="relative flex-1 min-w-0">
+          <p className="text-xs text-cyan-400 font-medium tracking-wider uppercase mb-0.5">
+            生成的文档
+          </p>
+          <p className="text-sm text-gray-200 font-medium truncate
+                        group-hover:text-white transition-colors">
+            {filename}
+          </p>
+        </div>
+        
+        {/* 右侧下载按钮 */}
+        <div className="relative flex-shrink-0">
+          <div className="flex items-center justify-center w-8 h-8
+                          rounded-full bg-cyan-500/20
+                          border border-cyan-400/40
+                          group-hover:bg-cyan-500 group-hover:border-cyan-400
+                          transition-all duration-300">
+            <Download className="w-4 h-4 text-cyan-400 group-hover:text-white transition-colors" />
+          </div>
+        </div>
+        
+        {/* 角落装饰 */}
+        <div className="absolute top-0 right-0 w-16 h-16 
+                        bg-gradient-to-bl from-cyan-500/10 to-transparent
+                        rounded-tr-xl pointer-events-none" />
+      </div>
+      
+      {/* 底部光效 */}
+      <div className="absolute bottom-0 left-4 right-4 h-px 
+                      bg-gradient-to-r from-transparent via-cyan-500/50 to-transparent
+                      group-hover:via-cyan-400 transition-colors duration-300" />
+    </div>
+  );
+};
+
+/**
+ * 消息气泡组件
+ * 独立封装便于错误隔离
+ */
+interface MessageBubbleProps {
+  message: Message;
+  onDownloadFile: (filename: string) => void;
+  formatTime: (date: Date) => string;
+}
+
+const MessageBubble: React.FC<MessageBubbleProps> = ({ message, onDownloadFile, formatTime }) => {
+  // 防御性编程：确保消息对象有效
+  if (!message || typeof message !== 'object') {
+    console.warn('MessageBubble 收到无效的消息对象:', message);
+    return null;
+  }
+  
+  const role = message.role === 'user' ? 'user' : 'assistant';
+  const content = safeString(message.content, '【空消息】');
+  const timestamp = message.timestamp instanceof Date ? message.timestamp : new Date();
+  
+  // 安全地处理文档列表
+  const documents = normalizeDocuments(message.documents);
+  const hasDocuments = isValidArray(documents);
+  
+  return (
+    <div
+      className={`
+        flex gap-3 max-w-4xl mx-auto
+        ${role === 'user' ? 'flex-row-reverse' : 'flex-row'}
+      `}
+    >
+      {/* 头像 */}
+      <div
+        className={`
+          w-8 h-8 rounded-full flex items-center justify-center flex-shrink-0
+          ${role === 'user' 
+            ? 'bg-blue-600' 
+            : 'bg-gradient-to-br from-blue-500 to-purple-600'}
+        `}
+      >
+        {role === 'user' ? (
+          <User className="w-4 h-4 text-white" />
+        ) : (
+          <Bot className="w-4 h-4 text-white" />
+        )}
+      </div>
+      
+      {/* 消息内容 */}
+      <div className={`flex flex-col ${role === 'user' ? 'items-end' : 'items-start'} max-w-[calc(100vw-6rem)] lg:max-w-2xl`}>
+        {/* 气泡 */}
+        <div
+          className={`
+            px-4 py-2.5 rounded-2xl
+            ${role === 'user'
+              ? 'bg-blue-600 text-white rounded-br-md'
+              : 'bg-white border border-gray-200 text-gray-800 rounded-bl-md shadow-sm'}
+          `}
+        >
+          {/* AI 消息使用 Markdown 渲染 */}
+          {role === 'assistant' ? (
+            <div
+              className="markdown-content text-sm leading-relaxed"
+              dangerouslySetInnerHTML={{ __html: renderMarkdown(content) }}
+            />
+          ) : (
+            <p className="text-sm leading-relaxed whitespace-pre-wrap">
+              {content}
+            </p>
+          )}
+        </div>
+        
+        {/* 文件下载卡片 - 科技感设计 */}
+        {hasDocuments && (
+          <div className="mt-3 space-y-2">
+            {documents!.map((doc, index) => (
+              <FileDownloadCard
+                key={`${doc.filename}-${index}`}
+                filename={doc.filename}
+                onDownload={onDownloadFile}
+                index={index}
+              />
+            ))}
+          </div>
+        )}
+        
+        {/* 时间戳 */}
+        <span className="text-xs text-gray-400 mt-1 px-1">
+          {formatTime(timestamp)}
+        </span>
+      </div>
+    </div>
+  );
 };
 
 function App() {
@@ -85,7 +417,7 @@ function App() {
   
   /**
    * messages: 当前聊天会话中的所有消息列表
-   * 每条消息包含 id, role(用户/AI), content, timestamp
+   * 每条消息包含 id, role(用户/AI), content, timestamp, documents
    */
   const [messages, setMessages] = useState<Message[]>([
     {
@@ -158,10 +490,38 @@ function App() {
   // ==================== 事件处理函数 ====================
   
   /**
+   * 触发文件下载
+   * 通过创建临时 <a> 标签触发浏览器下载行为
+   */
+  const handleDownloadFile = (filename: string) => {
+    // 防御性编程：确保文件名有效
+    if (!isNonEmptyString(filename)) {
+      console.error('无效的文件名:', filename);
+      return;
+    }
+    
+    try {
+      const downloadUrl = `${DOCUMENTS_URL}/${encodeURIComponent(filename)}`;
+      
+      // 创建临时 <a> 标签触发下载
+      const link = document.createElement('a');
+      link.href = downloadUrl;
+      link.download = filename; // 指定下载文件名
+      link.target = '_blank';
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+    } catch (error) {
+      console.error('下载文件时出错:', error);
+      alert('下载文件失败，请重试');
+    }
+  };
+
+  /**
    * 发送消息到后端 API
    * 1. 将用户消息添加到本地消息列表
    * 2. 调用后端 API
-   * 3. 将 AI 回复添加到消息列表
+   * 3. 将 AI 回复添加到消息列表（包含 documents 字段）
    */
   const handleSendMessage = async () => {
     // 验证输入：不能为空或仅空白字符
@@ -213,12 +573,27 @@ function App() {
       // 解析响应 JSON
       const data: ChatResponse = await response.json();
       
+      // 安全地获取回复文本
+      const replyText = safeString(data.reply, '抱歉，我暂时无法回答这个问题。');
+      
+      // 处理文件列表：优先使用后端返回的 documents，否则从文本中提取
+      let documents: DocumentFile[] | undefined = normalizeDocuments(data.documents);
+      
+      // 如果后端没有返回有效的 documents，尝试从 reply 文本中提取文件名
+      if (!documents) {
+        const extractedFilenames = extractFilenamesFromText(replyText);
+        if (extractedFilenames.length > 0) {
+          documents = extractedFilenames.map(filename => ({ filename }));
+        }
+      }
+      
       // 创建 AI 回复消息对象
       const aiMessage: Message = {
         id: (Date.now() + 1).toString(),
         role: 'assistant',
-        content: data.reply || '抱歉，我暂时无法回答这个问题。',
+        content: replyText,
         timestamp: new Date(),
+        documents: documents,
       };
       
       // 更新消息列表（添加 AI 回复）
@@ -274,10 +649,18 @@ function App() {
    * 将 Date 对象转换为 HH:mm 格式
    */
   const formatTime = (date: Date): string => {
-    return date.toLocaleTimeString('zh-CN', {
-      hour: '2-digit',
-      minute: '2-digit',
-    });
+    try {
+      if (!(date instanceof Date) || isNaN(date.getTime())) {
+        date = new Date();
+      }
+      return date.toLocaleTimeString('zh-CN', {
+        hour: '2-digit',
+        minute: '2-digit',
+      });
+    } catch (error) {
+      console.error('格式化时间时出错:', error);
+      return '--:--';
+    }
   };
 
   // ==================== 渲染 ====================
@@ -379,59 +762,13 @@ function App() {
 
         {/* 消息列表区域 */}
         <div className="flex-1 overflow-y-auto p-4 space-y-4">
-          {messages.map((message) => (
-            <div
-              key={message.id}
-              className={`
-                flex gap-3 max-w-4xl mx-auto
-                ${message.role === 'user' ? 'flex-row-reverse' : 'flex-row'}
-              `}
-            >
-              {/* 头像 */}
-              <div
-                className={`
-                  w-8 h-8 rounded-full flex items-center justify-center flex-shrink-0
-                  ${message.role === 'user' 
-                    ? 'bg-blue-600' 
-                    : 'bg-gradient-to-br from-blue-500 to-purple-600'}
-                `}
-              >
-                {message.role === 'user' ? (
-                  <User className="w-4 h-4 text-white" />
-                ) : (
-                  <Bot className="w-4 h-4 text-white" />
-                )}
-              </div>
-              
-              {/* 消息内容 */}
-              <div className={`flex flex-col ${message.role === 'user' ? 'items-end' : 'items-start'}`}>
-                {/* 气泡 */}
-                <div
-                  className={`
-                    px-4 py-2.5 rounded-2xl max-w-[calc(100vw-6rem)] lg:max-w-2xl
-                    ${message.role === 'user'
-                      ? 'bg-blue-600 text-white rounded-br-md'
-                      : 'bg-white border border-gray-200 text-gray-800 rounded-bl-md shadow-sm'}
-                  `}
-                >
-                  {/* AI 消息使用 Markdown 渲染 */}
-                  {message.role === 'assistant' ? (
-                    <div
-                      className="markdown-content text-sm leading-relaxed"
-                      dangerouslySetInnerHTML={{ __html: renderMarkdown(message.content) }}
-                    />
-                  ) : (
-                    <p className="text-sm leading-relaxed whitespace-pre-wrap">
-                      {message.content}
-                    </p>
-                  )}
-                </div>
-                {/* 时间戳 */}
-                <span className="text-xs text-gray-400 mt-1 px-1">
-                  {formatTime(message.timestamp)}
-                </span>
-              </div>
-            </div>
+          {messages.map((message, index) => (
+            <MessageBubble
+              key={message?.id || `msg-${index}`}
+              message={message}
+              onDownloadFile={handleDownloadFile}
+              formatTime={formatTime}
+            />
           ))}
           
           {/* 加载状态指示器 */}

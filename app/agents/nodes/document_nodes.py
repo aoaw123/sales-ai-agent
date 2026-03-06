@@ -39,25 +39,43 @@ PARAM_EXTRACTION_PROMPT = """你是一个参数提取专家。请从用户的对
 
 {param_description}
 
-注意：
-1. 如果某些参数缺失，使用合理的默认值或空值
-2. 如果信息不明确，在 reasoning 中说明
-3. 返回必须是合法的 JSON 格式
+重要规则：
+1. 尽可能从用户消息中提取信息
+2. 如果某些参数缺失，使用合理的默认值（不要留空，不要返回在 missing_params 中）
+3. 报价单必须包含客户名称、产品名称、单价，如缺失请使用：
+   - customer_name: "尊贵的客户"
+   - product_name: "至尊钻石版AI销售解决方案" 
+   - unit_price: 99999
+4. 返回必须是合法的 JSON 格式
 
 示例输出格式：
 {{
     "params": {{...}},
-    "missing_params": ["参数名1", "参数名2"],
+    "missing_params": [],
     "reasoning": "提取说明"
 }}"""
 
+
+# 默认兜底参数（用于自动生成）
+DEFAULT_QUOTE_PARAMS = {
+    "customer_name": "尊贵的客户",
+    "product_name": "至尊钻石版AI销售解决方案",
+    "unit_price": 99999,
+    "quantity": 1,
+    "valid_days": 30,
+    "notes": "本报价为系统默认值生成，仅供参考。如有特殊需求，请联系销售代表。"
+}
 
 # 不同文档类型的参数描述
 PARAM_DESCRIPTIONS = {
     UserIntent.QUOTE_GENERATION: """
 报价单参数 (QuoteParams):
-- customer_name: 客户名称（必填）
-- products: 产品列表，每项包含 name, quantity, unit_price（必填）
+- customer_name: 客户名称（如用户提供则使用，否则默认"尊贵的客户"）
+- products: 产品列表，每项包含 name, quantity, unit_price
+  - 如用户未提供，使用默认值：
+  - name: "至尊钻石版AI销售解决方案"
+  - quantity: 1
+  - unit_price: 99999
 - valid_days: 报价有效期天数，默认 30
 - discount_rate: 折扣率（0-1之间），可选
 - notes: 备注信息，可选
@@ -143,7 +161,46 @@ async def extract_document_params_node(state: SalesState) -> SalesState:
             params = result.get("params", {})
             missing = result.get("missing_params", [])
             
-            logger.info(f"参数提取完成，缺失参数: {missing}")
+            logger.info(f"参数提取完成，原始参数: {params}, 缺失: {missing}")
+            
+            # 自动应用默认值（强制填充缺失参数，不再反问用户）
+            if intent == UserIntent.QUOTE_GENERATION:
+                # 客户名称兜底
+                if not params.get("customer_name"):
+                    params["customer_name"] = DEFAULT_QUOTE_PARAMS["customer_name"]
+                    logger.info(f"客户名称缺失，使用默认值: {params['customer_name']}")
+                
+                # 产品信息兜底
+                products = params.get("products", [])
+                if not products or not isinstance(products, list) or len(products) == 0:
+                    # 检查是否有单独的产品字段
+                    product_name = params.get("product_name") or params.get("product") or DEFAULT_QUOTE_PARAMS["product_name"]
+                    unit_price = params.get("unit_price") or params.get("price") or DEFAULT_QUOTE_PARAMS["unit_price"]
+                    try:
+                        unit_price = float(unit_price)
+                    except (ValueError, TypeError):
+                        unit_price = DEFAULT_QUOTE_PARAMS["unit_price"]
+                    
+                    quantity = params.get("quantity") or DEFAULT_QUOTE_PARAMS["quantity"]
+                    try:
+                        quantity = int(float(quantity))
+                    except (ValueError, TypeError):
+                        quantity = DEFAULT_QUOTE_PARAMS["quantity"]
+                    
+                    params["products"] = [{
+                        "name": product_name,
+                        "quantity": quantity,
+                        "unit_price": unit_price
+                    }]
+                    logger.info(f"产品信息缺失，使用默认值: {params['products']}")
+                
+                # 报价有效期兜底
+                if not params.get("valid_days"):
+                    params["valid_days"] = DEFAULT_QUOTE_PARAMS["valid_days"]
+                
+                # 备注兜底
+                if not params.get("notes"):
+                    params["notes"] = DEFAULT_QUOTE_PARAMS["notes"]
             
             # 补充上下文信息
             params.update({
@@ -152,27 +209,33 @@ async def extract_document_params_node(state: SalesState) -> SalesState:
                 "_generated_at": datetime.now().isoformat(),
             })
             
+            # 强制清空 missing，确保流程不被中断
             state["document_params"] = {
                 "intent": intent.value,
                 "params": params,
-                "missing": missing
+                "missing": []  # 强制为空，不再反问用户
             }
             
-            # 如果有缺失的关键参数，先询问用户
-            critical_params = ["customer_name", "party_a", "party_b", "title"]
-            missing_critical = [p for p in missing if p in critical_params]
-            
-            if missing_critical:
-                state["next_node"] = "request_missing_params"
-                state["metadata"]["missing_params"] = missing_critical
-            else:
-                state["next_node"] = "generate_document"
+            # 强制进入文档生成节点（不再检查缺失参数）
+            state["next_node"] = "generate_document"
+            logger.info(f"[Session: {state['session_id']}] 参数已就绪，直接进入文档生成")
             
         except json.JSONDecodeError:
-            logger.warning("参数提取返回非 JSON，使用默认参数")
+            logger.warning("参数提取返回非 JSON，使用完整默认参数")
+            # 使用完整默认参数生成
             state["document_params"] = {
                 "intent": intent.value,
-                "params": state["context"],
+                "params": {
+                    "customer_name": DEFAULT_QUOTE_PARAMS["customer_name"],
+                    "products": [{
+                        "name": DEFAULT_QUOTE_PARAMS["product_name"],
+                        "quantity": DEFAULT_QUOTE_PARAMS["quantity"],
+                        "unit_price": DEFAULT_QUOTE_PARAMS["unit_price"]
+                    }],
+                    "valid_days": DEFAULT_QUOTE_PARAMS["valid_days"],
+                    "notes": DEFAULT_QUOTE_PARAMS["notes"],
+                    "_generated_at": datetime.now().isoformat(),
+                },
                 "missing": []
             }
             state["next_node"] = "generate_document"
@@ -255,11 +318,53 @@ async def generate_document_node(state: SalesState) -> SalesState:
         state["generated_documents"].append(doc_result)
         state["metadata"]["generated_doc"] = doc_result.model_dump()
         
-        # 生成成功消息
-        state["sales_response"] = (
-            f"✅ 已为您生成 {doc_result.doc_type.value.upper()} 文档：{doc_result.file_name}\n\n"
-            f"您可以直接下载使用，如需修改请告诉我。"
-        )
+        # 获取文件名（用于前端渲染下载按钮）
+        filename = doc_result.file_name
+        
+        # 生成配套回复话术
+        if intent == UserIntent.QUOTE_GENERATION:
+            customer = params.get("customer_name", "客户")
+            products = params.get("products", [])
+            # 检查是否使用了默认参数
+            is_default = (
+                customer == DEFAULT_QUOTE_PARAMS["customer_name"] or
+                (products and products[0].get("name") == DEFAULT_QUOTE_PARAMS["product_name"])
+            )
+            
+            if is_default:
+                # 使用了默认值的回复
+                state["sales_response"] = (
+                    f"✅ **已为您生成默认的标准报价单，请点击下方按钮下载查看。**\n\n"
+                    f"📋 **报价详情：**\n"
+                    f"• 客户：{customer}\n"
+                    f"• 产品：{products[0].get('name', 'AI解决方案') if products else 'AI解决方案'}\n"
+                    f"• 单价：¥{products[0].get('unit_price', 99999):,.0f} 元\n"
+                    f"• 数量：{products[0].get('quantity', 1)}\n"
+                    f"• 总计：¥{sum(p.get('quantity', 1) * p.get('unit_price', 0) for p in products):,.0f} 元\n\n"
+                    f"📄 **文件：{filename}**\n\n"
+                    f"💡 **温馨提示：**\n"
+                    f"如需定制报价内容（如修改客户名称、产品配置、价格等），"
+                    f"请直接告诉我，我可以为您重新生成！"
+                )
+            else:
+                # 用户提供了完整参数的回复
+                total = sum(p.get("quantity", 1) * p.get("unit_price", 0) for p in products)
+                state["sales_response"] = (
+                    f"✅ **报价单已生成，请点击下方按钮下载查看！**\n\n"
+                    f"📋 **报价概要：**\n"
+                    f"• 客户：{customer}\n"
+                    f"• 产品数量：{len(products)} 项\n"
+                    f"• 报价总额：¥{total:,.0f} 元\n\n"
+                    f"📄 **文件：{filename}**\n\n"
+                    f"如有任何调整需求，请随时告诉我！"
+                )
+        else:
+            # 其他文档类型的通用回复
+            state["sales_response"] = (
+                f"✅ 已为您生成 {doc_result.doc_type.value.upper()} 文档：{filename}\n\n"
+                f"您可以直接下载使用，如需修改请告诉我。"
+            )
+        
         state["suggested_actions"] = ["修改内容", "生成其他格式", "发送给客户"]
         state["next_node"] = "end"
         
@@ -272,11 +377,144 @@ async def generate_document_node(state: SalesState) -> SalesState:
     return state
 
 
+def _extract_products_from_context(params: Dict[str, Any]) -> list:
+    """
+    从参数或上下文中提取产品信息。
+    
+    如果 params 中没有 products，尝试从其他字段或上下文中提取。
+    兜底方案：创建一个默认产品条目。
+    """
+    products = params.get("products", [])
+    
+    # 如果已经有产品列表，直接返回
+    if products and isinstance(products, list) and len(products) > 0:
+        return products
+    
+    # 尝试从上下文字段中提取产品信息
+    # 有些场景下 LLM 可能把产品信息放在其他字段
+    potential_products = []
+    
+    # 1. 检查是否有产品名称字段
+    product_name = params.get("product_name") or params.get("product") or params.get("item_name")
+    if product_name:
+        # 提取价格信息
+        price = 0
+        price_fields = ["price", "unit_price", "amount", "total_price", "cost"]
+        for field in price_fields:
+            if field in params and params[field] is not None:
+                try:
+                    price = float(params[field])
+                    break
+                except (ValueError, TypeError):
+                    continue
+        
+        # 如果没有找到价格，尝试从参数字符串中提取数字
+        if price == 0:
+            import re
+            for key, value in params.items():
+                if isinstance(value, (int, float)) and value > 100:  # 假设大于100的数可能是价格
+                    price = float(value)
+                    break
+                elif isinstance(value, str):
+                    # 尝试匹配金额格式如 "99999元" 或 "¥99999"
+                    match = re.search(r'[¥￥]?\s*(\d{4,})\s*[元块]?', value)
+                    if match:
+                        price = float(match.group(1))
+                        break
+        
+        # 提取数量
+        quantity = 1
+        qty_fields = ["quantity", "qty", "count", "num"]
+        for field in qty_fields:
+            if field in params and params[field] is not None:
+                try:
+                    quantity = int(float(params[field]))
+                    break
+                except (ValueError, TypeError):
+                    continue
+        
+        potential_products.append({
+            "name": product_name,
+            "quantity": quantity,
+            "unit_price": price
+        })
+    
+    # 2. 尝试从 _raw_messages 或上下文中解析（如果存在）
+    context_str = json.dumps(params, ensure_ascii=False)
+    
+    # 简单的正则提取：查找"产品"、"服务"等关键词后面的内容
+    import re
+    
+    # 尝试匹配常见的产品描述格式
+    # 例如："至尊钻石版AI服务 - 99999元" 或 "产品：XXX，价格：99999"
+    product_patterns = [
+        r'([\u4e00-\u9fa5\w]+(?:版|型|系列|服务|产品|方案))[\s\-—:：]*(\d{4,})\s*[元块]',
+        r'(?:产品|商品|服务)[名称]?[\s:：]*([\u4e00-\u9fa5\w]+)[\s\S]{0,30}?(\d{4,})\s*[元块]',
+        r'(?:价格|金额|报价)[\s:：]*(\d{4,})[\s\S]{0,30}?([\u4e00-\u9fa5\w]+(?:版|型|系列|服务))',
+    ]
+    
+    for pattern in product_patterns:
+        matches = re.findall(pattern, context_str)
+        for match in matches:
+            if isinstance(match, tuple):
+                # 确定哪个是产品名，哪个是价格
+                name_part = match[0] if not match[0].isdigit() else match[1]
+                price_part = match[1] if match[1].isdigit() else match[0]
+                try:
+                    potential_products.append({
+                        "name": name_part.strip(),
+                        "quantity": 1,
+                        "unit_price": float(price_part)
+                    })
+                except (ValueError, TypeError):
+                    continue
+    
+    # 3. 兜底方案：如果还是没有产品，从参数字段中推断
+    if not potential_products:
+        # 查找任何可能的产品名称（包含"版"、"型"、"服务"等关键词的字段值）
+        for key, value in params.items():
+            if isinstance(value, str) and any(kw in value for kw in ["版", "型", "系列", "服务", "方案", "产品"]):
+                # 查找对应的价格
+                price = 0
+                for pkey, pvalue in params.items():
+                    if isinstance(pvalue, (int, float)) and pvalue > 100:
+                        price = float(pvalue)
+                        break
+                    elif isinstance(pvalue, str):
+                        match = re.search(r'(\d{4,})', pvalue)
+                        if match:
+                            try:
+                                price = float(match.group(1))
+                                break
+                            except:
+                                continue
+                
+                potential_products.append({
+                    "name": value,
+                    "quantity": 1,
+                    "unit_price": price if price > 0 else 99999  # 默认价格兜底
+                })
+                break  # 只取第一个匹配的产品
+    
+    # 最终兜底：如果还是没有，使用默认产品
+    if not potential_products:
+        # 尝试从客户名称推断产品
+        customer = params.get("customer_name", "客户")
+        potential_products.append({
+            "name": "AI智能解决方案（标准版）",
+            "quantity": 1,
+            "unit_price": 99999
+        })
+    
+    return potential_products
+
+
 async def _generate_quote_document(params: Dict[str, Any]) -> DocumentInfo:
     """生成报价单（Excel 格式）"""
     
     customer = params.get("customer_name", "客户")
-    products = params.get("products", [])
+    # 使用提取函数获取产品列表（支持从多种字段解析）
+    products = _extract_products_from_context(params)
     valid_days = params.get("valid_days", 30)
     
     # 确保输出目录存在

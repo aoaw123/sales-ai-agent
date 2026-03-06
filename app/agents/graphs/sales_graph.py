@@ -154,7 +154,8 @@ def create_sales_graph() -> StateGraph:
     
     compiled_graph = workflow.compile(
         checkpointer=checkpointer,
-        interrupt_before=["request_missing_params"],  # 在请求参数前可中断
+        # 注意：已移除 interrupt_before，确保报价单生成流程一气呵成
+        # 不再在 request_missing_params 前中断，所有缺失参数使用默认值填充
     )
     
     logger.info("销售 AI Agent 工作流图编译完成")
@@ -198,20 +199,18 @@ def _route_by_params_status(state: SalesState) -> str:
     """
     根据参数提取状态路由
     
-    如果有缺失的关键参数，请求补充；否则直接生成文档。
+    注意：当前策略是强制生成文档，即使缺少参数也使用默认值直接生成，
+    不再反问用户补充参数，确保流程一气呵成。
     """
     doc_params = state.get("document_params", {})
     missing = doc_params.get("missing", [])
     
-    # 检查是否有缺失的关键参数
-    critical_params = ["customer_name", "party_a", "party_b", "title"]
-    missing_critical = [p for p in missing if p in critical_params]
+    # 记录缺失的参数用于日志，但不再阻断流程
+    if missing:
+        logger.info(f"检测到缺失参数，将使用默认值直接生成: {missing}")
     
-    if missing_critical:
-        logger.info(f"缺少关键参数: {missing_critical}")
-        return "request_missing_params"
-    
-    logger.info("参数完整，进入文档生成")
+    # 强制进入文档生成节点，不再请求补充参数
+    logger.info("参数已就绪（含默认值），直接进入文档生成")
     return "generate_document"
 
 
@@ -225,6 +224,65 @@ def get_sales_graph():
     if _sales_graph is None:
         _sales_graph = create_sales_graph()
     return _sales_graph
+
+
+def _safe_extract_state(value, graph=None, config=None) -> dict:
+    """
+    安全地从 LangGraph 返回值中提取状态
+    
+    处理以下情况：
+    1. 直接的 state 字典
+    2. 元组 (state, config) - 可能为空元组
+    3. None 或其他异常值
+    
+    如果返回空元组且提供了 graph 和 config，
+    使用 graph.get_state(config).values 获取当前状态
+    """
+    # 情况1：已经是字典，直接返回
+    if isinstance(value, dict):
+        return value
+    
+    # 情况2：是元组，需要安全提取
+    if isinstance(value, tuple):
+        if len(value) > 0:
+            # 有内容，提取第一个元素
+            first_elem = value[0]
+            # 如果第一个元素是字典，返回它
+            if isinstance(first_elem, dict):
+                return first_elem
+            # 否则可能是 state 对象，尝试转换为 dict
+            elif hasattr(first_elem, '__dict__'):
+                return first_elem.__dict__
+            else:
+                return {"_raw_state": first_elem}
+        else:
+            # 空元组！说明 LangGraph 被 interrupt 中断了
+            logger.warning("LangGraph 返回空元组，尝试从检查点恢复状态")
+            if graph is not None and config is not None:
+                try:
+                    # 使用 get_state 获取当前状态
+                    checkpoint_state = graph.get_state(config)
+                    if checkpoint_state and hasattr(checkpoint_state, 'values'):
+                        return checkpoint_state.values
+                    elif isinstance(checkpoint_state, dict):
+                        return checkpoint_state
+                except Exception as e:
+                    logger.error(f"从检查点恢复状态失败: {e}")
+            # 无法恢复，返回空字典
+            return {}
+    
+    # 情况3：是 state 对象，有 values 属性（LangGraph 的新版本可能返回这种）
+    if hasattr(value, 'values') and isinstance(value.values, dict):
+        return value.values
+    
+    # 情况4：其他类型，尝试转换
+    if value is not None:
+        if hasattr(value, '__dict__'):
+            return value.__dict__
+        return {"_raw_state": value}
+    
+    # 情况5：None，返回空字典
+    return {}
 
 
 async def run_sales_agent(
@@ -243,7 +301,7 @@ async def run_sales_agent(
         history: 历史消息
     
     Returns:
-        最终状态
+        最终状态（始终返回字典，不会是元组）
     """
     graph = get_sales_graph()
     
@@ -265,11 +323,38 @@ async def run_sales_agent(
     
     # 执行工作流
     final_state = None
-    async for event in graph.astream(initial_state, config):
-        for key, value in event.items():
-            logger.debug(f"节点 {key} 执行完成")
-            final_state = value
+    last_valid_state = None
+    
+    try:
+        async for event in graph.astream(initial_state, config):
+            for key, value in event.items():
+                logger.debug(f"节点 {key} 执行完成")
+                # 安全地提取状态
+                extracted = _safe_extract_state(value, graph, config)
+                if extracted:
+                    last_valid_state = extracted
+                    final_state = extracted
+    except Exception as e:
+        logger.error(f"工作流执行异常: {e}")
+        # 尝试从检查点获取状态
+        final_state = _safe_extract_state((), graph, config)
     
     logger.info(f"[Session: {session_id}] 工作流执行完成")
+    
+    # 最终安全检查：确保返回的是 dict，不是 tuple 或 None
+    final_state = _safe_extract_state(final_state, graph, config)
+    
+    # 如果最终状态为空但之前有有效状态，使用之前的
+    if not final_state and last_valid_state:
+        final_state = last_valid_state
+        logger.info(f"[Session: {session_id}] 使用最后有效状态")
+    
+    # 确保至少有基本的字段
+    if not final_state:
+        final_state = {
+            "session_id": session_id,
+            "sales_response": "正在处理您的请求，请稍后再试。",
+            "error": "无法获取有效状态"
+        }
     
     return final_state
