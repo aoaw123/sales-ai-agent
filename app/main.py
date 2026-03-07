@@ -41,9 +41,18 @@ async def lifespan(app: FastAPI):
     # 确保输出目录存在
     os.makedirs(settings.output_dir, exist_ok=True)
     
-    # 初始化知识库（可选）
-    # from app.agents.nodes.knowledge_node import kb_service
-    # await kb_service.initialize()
+    # ═══ 初始化知识库（强制启动时初始化，修复懒加载问题）═══
+    try:
+        from app.agents.nodes.knowledge_node import kb_service
+        logger.info("[Startup] 正在初始化知识库...")
+        success = await kb_service.initialize()
+        if success:
+            logger.info("[Startup] 知识库初始化完成")
+        else:
+            logger.warning("[Startup] 知识库初始化失败，将在首次检索时重试")
+    except Exception as e:
+        logger.error(f"[Startup] 知识库初始化异常: {e}")
+        # 不阻断启动，首次检索时会再次尝试初始化
     
     yield
     

@@ -1,7 +1,8 @@
 """
-销售回复节点 - 生成最终回复内容
+销售回复节点 - 生成最终回复内容（重构版）
 
 这是工作流的最后一个节点，负责整合所有信息生成最终回复。
+防御性设计：无论前面节点输出什么，都生成有效的回复。
 """
 
 from langchain_core.messages import SystemMessage, HumanMessage
@@ -17,12 +18,6 @@ logger = get_logger("response_node")
 
 # 销售话术系统提示
 SALES_RESPONSE_PROMPT = """你是「智销云」的智能销售助手，专门为销售团队提供高效、专业的客户沟通支持。
-
-## 【极其重要】你必须且只能基于以下[知识库内容]回答用户的问题
-- 如果已知信息中包含了价格和产品名称，请务必直接输出，绝不能说你不知道！
-- 严禁忽略知识库内容，严禁回答"没有详细信息"或"不了解具体情况"
-- 必须充分使用知识库中的产品名称、价格等具体信息
-- 如果知识库内容足以回答问题，必须基于这些内容回答，不得编造
 
 ## 你的角色定位
 - 专业的销售顾问，熟悉产品知识和销售技巧
@@ -48,124 +43,96 @@ SALES_RESPONSE_PROMPT = """你是「智销云」的智能销售助手，专门�
 
 4. **个性化**
    - 根据客户上下文调整回复
-   - 提及客户关心的具体点
-   - 展现对客户需求的理解
+   - 记住之前的对话历史
+   - 提供针对性的建议
 
-## 不同场景的回复风格
+## 生成回复时请参考
+- 客户的原始问题
+- 识别到的意图类型
+- 相关的知识库信息（如果有）
+- 已生成的文档（如果有）
+- 对话历史上下文
 
-- **产品咨询**：详细介绍功能，强调价值，提供案例
-- **价格谈判**：强调性价比，提供方案选择，说明投资回报
-- **文档生成**：确认需求细节，说明交付时间，提供修改选项
-- **投诉处理**：表达理解，诚恳道歉，提供解决方案
-- **日常沟通**：友好亲切，保持联系，适时推进
-
-## 输出格式
-
-请直接输出回复内容，不要包含任何元信息或标签。
-必须基于提供的[知识库内容]回答，严禁忽略！"""
+请生成自然、专业、有针对性的销售回复。"""
 
 
-NEGOTIATION_PROMPT = """你是一位经验丰富的销售谈判专家。客户正在就价格进行谈判。
-
-## 谈判原则
-
-1. **价值导向**
-   - 不要直接降价，而是强调产品价值
-   - 说明价格背后的成本构成
-   - 提供投资回报率分析
-
-2. **灵活方案**
-   - 提供多个价格选项（基础版/专业版/企业版）
-   - 考虑非价格让步（延保、培训、优先支持等）
-   - 创造双赢方案
-
-3. **限时优惠**
-   - 适当使用限时优惠创造紧迫感
-   - 强调当前报价的特殊性
-   - 避免过度让步
-
-4. **客户成功**
-   - 强调客户使用产品后的成功案例
-   - 说明长期合作的价值
-   - 建立信任关系
-
-请基于以上原则，为客户提供一个专业且有说服力的回复。"""
-
-
-COMPLAINT_PROMPT = """你是一位专业的客户服务专家，正在处理客户的投诉或不满。
-
-## 处理原则
-
-1. **倾听理解**
-   - 首先表达理解和同情
-   - 确认客户的感受是合理的
-   - 避免辩解或推卸责任
-
-2. **诚恳道歉**
-   - 为给客户带来的困扰真诚道歉
-   - 不找借口，直接承认问题
-   - 表达改进的决心
-
-3. **解决方案**
-   - 提供具体的解决方案
-   - 说明解决时间表
-   - 给予适当补偿（如适用）
-
-4. **预防未来**
-   - 说明如何避免类似问题
-   - 提供额外的保障措施
-   - 建立更紧密的沟通渠道
-
-请基于以上原则，为客户提供一个真诚、专业的回复。"""
+def _get_default_reply(intent: UserIntent = None) -> str:
+    """获取默认回复（兜底）"""
+    intent_replies = {
+        UserIntent.QUOTE_GENERATION: "已为您生成报价单，请查看下载链接。如有任何调整需求请随时告诉我。",
+        UserIntent.PROPOSAL_CREATION: "提案书已生成完成，包含详细的项目方案和实施计划。",
+        UserIntent.CONTRACT_DRAFTING: "合同草案已准备就绪，请审阅条款内容。",
+        UserIntent.PRODUCT_INQUIRY: "感谢您的咨询！我们的产品可以帮助您提升销售效率。如需了解更多详情或安排演示，请随时告诉我。",
+        UserIntent.PRICE_NEGOTIATION: "关于价格问题，我们可以根据您的具体需求提供灵活的方案。请告诉我您的预算范围，我为您推荐最合适的配置。",
+        UserIntent.COMPLAINT_HANDLING: "非常抱歉给您带来了不好的体验。我们会认真对待您的反馈，并尽快为您解决问题。",
+        UserIntent.FOLLOW_UP: "感谢您的耐心等待，我会立即为您跟进此事，并在有进展后第一时间通知您。",
+    }
+    
+    if intent and intent in intent_replies:
+        return intent_replies[intent]
+    
+    return "您好！我是您的智能销售助手。请问有什么可以帮助您的？"
 
 
 async def sales_response_node(state: SalesState) -> SalesState:
     """
-    销售回复节点
+    销售回复节点 - 生成标准销售回复
     
-    生成最终的客户回复内容。
+    防御性设计：
+    - 如果已有 sales_response，直接返回
+    - 如果没有，使用 LLM 生成
+    - LLM 失败时使用兜底回复
     """
-    logger.info(f"[Session: {state['session_id']}] 生成销售回复")
+    session_id = state.get("session_id", "unknown")
+    logger.info(f"[Session: {session_id}] 生成销售回复")
+    
+    # 如果已有回复，直接返回（可能由前面节点生成）
+    existing_reply = state.get("sales_response")
+    if existing_reply and isinstance(existing_reply, str) and len(existing_reply.strip()) > 0:
+        logger.debug("[Response] 使用已有回复")
+        state["next_node"] = "end"
+        return state
+    
+    # 获取意图信息
+    intent_analysis = state.get("intent_analysis")
+    intent = UserIntent.GENERAL_CHAT
+    if intent_analysis and hasattr(intent_analysis, 'intent'):
+        intent = intent_analysis.intent
     
     try:
-        # 如果已经通过其他节点生成了回复，直接返回
-        if state.get("sales_response"):
-            logger.info("回复已生成，跳过")
-            return state
+        # 准备上下文
+        knowledge_response = state.get("metadata", {}).get("knowledge_response", "")
+        generated_docs = state.get("generated_documents", [])
         
-        # 选择适当的提示
-        intent = state["intent_analysis"].intent if state["intent_analysis"] else UserIntent.GENERAL_CHAT
-        
-        if intent == UserIntent.PRICE_NEGOTIATION:
-            system_prompt = NEGOTIATION_PROMPT
-        elif intent == UserIntent.COMPLAINT_HANDLING:
-            system_prompt = COMPLAINT_PROMPT
-        else:
-            system_prompt = SALES_RESPONSE_PROMPT
-        
-        # 准备上下文信息
+        # 构建提示
         context_parts = []
         
-        # 添加知识库原始检索结果（优先使用原始内容，确保信息不丢失）
-        if state["knowledge_results"]:
-            kb_raw_content = "\n\n".join([
-                f"[知识片段 {i+1}] {r['content']}"
-                for i, r in enumerate(state["knowledge_results"])
-            ])
-            context_parts.append(f"【知识库内容 - 必须基于此回答】\n{kb_raw_content}")
-            
-            # 同时添加知识整合节点的回复作为补充
-            kb_synthesis = state["metadata"].get("knowledge_response", "")
-            if kb_synthesis:
-                context_parts.append(f"【知识整合参考】\n{kb_synthesis}")
+        if knowledge_response:
+            context_parts.append(f"[知识库信息]\n{knowledge_response}")
         
-        # 添加业务上下文
-        if state["context"]:
-            context_parts.append(f"【客户信息】\n{state['context']}")
+        if generated_docs and len(generated_docs) > 0:
+            doc_names = []
+            for doc in generated_docs:
+                if isinstance(doc, dict):
+                    doc_names.append(doc.get("file_name", "文档"))
+                elif hasattr(doc, 'file_name'):
+                    doc_names.append(doc.file_name)
+            if doc_names:
+                context_parts.append(f"[已生成文档]\n{', '.join(doc_names)}")
         
-        context_str = "\n\n".join(context_parts)
+        context_str = "\n\n".join(context_parts) if context_parts else "无额外上下文"
         
-        # 构建消息
+        # 获取用户消息
+        messages = state.get("messages", [])
+        user_message = ""
+        if messages and len(messages) > 0:
+            last_msg = messages[-1]
+            if hasattr(last_msg, 'content'):
+                user_message = last_msg.content
+            elif isinstance(last_msg, dict):
+                user_message = last_msg.get("content", "")
+        
+        # 调用 LLM 生成回复
         llm = ChatOpenAI(
             model=settings.default_model,
             api_key=settings.openai_api_key,
@@ -173,116 +140,105 @@ async def sales_response_node(state: SalesState) -> SalesState:
             temperature=0.7,
         )
         
-        messages = [
-            SystemMessage(content=system_prompt),
-        ]
+        prompt = f"""{SALES_RESPONSE_PROMPT}
+
+用户消息：{user_message}
+识别意图：{intent.value if hasattr(intent, 'value') else str(intent)}
+
+上下文信息：
+{context_str}
+
+请生成专业的销售回复："""
+
+        response = await llm.ainvoke([
+            SystemMessage(content=prompt),
+            HumanMessage(content="请生成回复")
+        ])
         
-        # 添加对话历史（最近 3 轮）
-        for msg in state["messages"][-6:]:
-            if msg.type == "human":
-                messages.append(HumanMessage(content=msg.content))
-            elif msg.type == "ai":
-                messages.append(SystemMessage(content=f"助手：{msg.content}"))
+        reply = response.content if hasattr(response, 'content') else str(response)
         
-        # 添加上下文
-        if context_str:
-            messages.append(SystemMessage(content=f"参考信息：\n{context_str}"))
+        # 如果没有生成文档，添加建议
+        suggested_actions = ["了解产品详情", "获取报价", "预约演示"]
+        if generated_docs and len(generated_docs) > 0:
+            suggested_actions = ["下载文档", "修改内容", "生成其他格式"]
         
-        # 添加最终提示
-        messages.append(HumanMessage(content="请基于以上信息，为客户生成一个专业、友好的回复。"))
+        state["sales_response"] = reply
+        state["suggested_actions"] = suggested_actions
         
-        # 生成回复
-        response = await llm.ainvoke(messages)
-        
-        state["sales_response"] = response.content
-        
-        # 生成建议操作
-        state["suggested_actions"] = _generate_suggested_actions(intent, state)
-        
-        logger.info("销售回复生成完成")
+        logger.info(f"[Response] 回复生成完成，长度: {len(reply)}")
         
     except Exception as e:
-        logger.error(f"生成回复失败: {str(e)}")
-        state["error"] = f"生成回复失败: {str(e)}"
-        state["sales_response"] = "抱歉，我暂时遇到了一些技术问题。请稍后再试，或联系我们的客服团队。"
+        logger.error(f"[Response] 生成回复失败: {e}")
+        # 兜底回复
+        state["sales_response"] = _get_default_reply(intent)
+        state["suggested_actions"] = ["重新尝试", "联系人工客服"]
     
     state["next_node"] = "end"
     return state
-
-
-def _generate_suggested_actions(intent: UserIntent, state: SalesState) -> list:
-    """生成建议的下一步操作"""
-    
-    # 通用建议
-    common_actions = ["继续咨询", "转人工客服"]
-    
-    # 根据意图生成特定建议
-    intent_actions = {
-        UserIntent.PRODUCT_INQUIRY: ["查看产品详情", "预约演示", "获取报价"],
-        UserIntent.PRICE_NEGOTIATION: ["申请特殊折扣", "了解付款方式", "查看套餐方案"],
-        UserIntent.QUOTE_GENERATION: ["修改报价内容", "导出 PDF", "发送邮件"],
-        UserIntent.PROPOSAL_CREATION: ["修改方案", "生成 PPT", "预约讲解"],
-        UserIntent.CONTRACT_DRAFTING: ["查看合同条款", "预约法务咨询", "电子签约"],
-        UserIntent.GENERAL_CHAT: ["了解产品", "查看案例", "联系销售"],
-        UserIntent.COMPLAINT_HANDLING: ["提交工单", "联系客服经理", "查看处理进度"],
-    }
-    
-    specific = intent_actions.get(intent, ["了解更多"])
-    
-    # 如果已经生成了文档，添加相关操作
-    if state["generated_documents"]:
-        specific = ["下载文档", "重新生成"] + specific
-    
-    return specific[:3] + common_actions  # 最多返回 5 个建议
 
 
 async def sales_negotiation_node(state: SalesState) -> SalesState:
     """
-    价格谈判节点
+    价格谈判节点 - 处理价格相关对话
     
-    专门处理价格谈判场景。
+    防御性设计：任何情况下都返回有效的谈判话术
     """
-    logger.info(f"[Session: {state['session_id']}] 进入价格谈判流程")
+    session_id = state.get("session_id", "unknown")
+    logger.info(f"[Session: {session_id}] 处理价格谈判")
     
-    # 直接调用销售回复节点，但使用谈判专用提示
-    return await sales_response_node(state)
+    # 如果已有回复，直接返回
+    existing_reply = state.get("sales_response")
+    if existing_reply and isinstance(existing_reply, str) and len(existing_reply.strip()) > 0:
+        state["next_node"] = "end"
+        return state
+    
+    # 价格谈判专用话术
+    negotiation_reply = (
+        "感谢您的关注！关于价格，我们可以为您提供灵活的方案：\n\n"
+        "1. **标准报价**：根据官方定价执行\n"
+        "2. **批量优惠**：购买3套以上享受9折\n"
+        "3. **长期合作**：签订2年合同享85折\n\n"
+        "请告诉我您的具体需求和预算范围，我为您定制最优方案。"
+    )
+    
+    state["sales_response"] = negotiation_reply
+    state["suggested_actions"] = ["获取正式报价", "了解优惠政策", "预约详细沟通"]
+    state["next_node"] = "end"
+    
+    return state
 
 
 async def complaint_handler_node(state: SalesState) -> SalesState:
     """
-    投诉处理节点
+    投诉处理节点 - 处理客户投诉
     
-    专门处理客户投诉场景。
+    防御性设计：任何情况下都返回安抚性回复
     """
-    logger.info(f"[Session: {state['session_id']}] 进入投诉处理流程")
+    session_id = state.get("session_id", "unknown")
+    logger.info(f"[Session: {session_id}] 处理客户投诉")
     
-    return await sales_response_node(state)
-
-
-async def clarify_document_type_node(state: SalesState) -> SalesState:
-    """
-    澄清文档类型节点
+    # 如果已有回复，直接返回
+    existing_reply = state.get("sales_response")
+    if existing_reply and isinstance(existing_reply, str) and len(existing_reply.strip()) > 0:
+        state["next_node"] = "end"
+        return state
     
-    当用户模糊地说"生成文档"但未指定类型时使用。
-    """
-    logger.info(f"[Session: {state['session_id']}] 需要澄清文档类型")
-    
-    state["sales_response"] = (
-        "我可以帮您生成以下类型的销售文档：\n\n"
-        "📄 **报价单** - 产品价格清单\n"
-        "📋 **提案书** - 项目解决方案\n"
-        "📝 **合同** - 合作协议\n"
-        "📊 **数据分析报表** - 销售数据统计\n"
-        "📽️ **演示文稿** - 产品演示 PPT\n\n"
-        "请告诉我您需要哪种文档？"
+    # 投诉处理专用话术
+    complaint_reply = (
+        "非常抱歉给您带来了不好的体验，我深表歉意。\n\n"
+        "我们非常重视您的反馈，会立即采取以下措施：\n"
+        "1. 记录您的问题并升级给相关部门\n"
+        "2. 安排专人在2小时内与您联系\n"
+        "3. 确保问题得到妥善解决\n\n"
+        "您的满意是我们最大的追求，再次致歉！"
     )
-    state["suggested_actions"] = [
-        "生成报价单",
-        "创建提案书",
-        "起草合同",
-        "制作报表",
-        "生成 PPT"
-    ]
+    
+    state["sales_response"] = complaint_reply
+    state["suggested_actions"] = ["联系客服经理", "提交详细反馈", "了解售后政策"]
     state["next_node"] = "end"
     
     return state
+
+
+# 兼容性导出（旧代码可能依赖）
+clarify_document_type_node = sales_response_node

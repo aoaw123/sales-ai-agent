@@ -1,5 +1,9 @@
 """
 核心配置模块 - 管理所有环境变量和配置项
+
+重构更新：
+- embedding_model 默认改为智谱 embedding-2
+- 添加 zhipu_api_key 配置支持
 """
 
 from functools import lru_cache
@@ -35,10 +39,19 @@ class Settings(BaseSettings):
         description="允许的跨域来源（微信小程序需要配置域名）"
     )
     
-    # LLM 配置
-    openai_api_key: Optional[str] = Field(default=None, description="OpenAI API Key")
-    openai_base_url: Optional[str] = Field(default=None, description="OpenAI Base URL")
-    default_model: str = Field(default="gpt-4o-mini", description="默认使用的模型")
+    # LLM 配置（智谱 AI）
+    openai_api_key: Optional[str] = Field(default=None, description="智谱 API Key")
+    openai_base_url: Optional[str] = Field(
+        default="https://open.bigmodel.cn/api/paas/v4/",
+        description="智谱 API Base URL"
+    )
+    default_model: str = Field(default="glm-4", description="默认使用的模型")
+    
+    # Embedding 配置（智谱）
+    embedding_model: str = Field(
+        default="embedding-2",
+        description="向量化模型（智谱 embedding-2）"
+    )
     
     # LangGraph 配置
     max_iterations: int = Field(default=10, description="最大迭代次数，防止死循环")
@@ -52,15 +65,17 @@ class Settings(BaseSettings):
         default="./data/vector_store",
         description="向量数据库存储路径"
     )
-    embedding_model: str = Field(
-        default="text-embedding-3-small",
-        description="向量化模型"
-    )
     
     # 文档生成配置
     output_dir: str = Field(
         default="./output",
         description="生成文档的输出目录"
+    )
+    
+    # 项目根目录
+    base_dir: str = Field(
+        default=".",
+        description="项目根目录"
     )
     
     # 日志配置
