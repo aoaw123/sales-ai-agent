@@ -13,6 +13,7 @@ from typing import Dict, Any, Optional, Union
 from langgraph.graph import StateGraph, END
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from langgraph.checkpoint.memory import MemorySaver
+from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
 from psycopg_pool import AsyncConnectionPool
 from psycopg import AsyncConnection
 
@@ -231,7 +232,14 @@ async def initialize_database() -> bool:
             gssencmode="disable",
         )
         try:
-            checkpointer = AsyncPostgresSaver(conn)
+            # 配置序列化器，允许反序列化 app.models.chat 模块中的自定义类型
+            serde = JsonPlusSerializer(
+                allowed_msgpack_modules=[
+                    ("app.models.chat", "UserIntent"),
+                    ("app.models.chat", "IntentAnalysisResult"),
+                ]
+            )
+            checkpointer = AsyncPostgresSaver(conn, serde=serde)
             await checkpointer.setup()
         finally:
             await conn.close()
@@ -334,8 +342,14 @@ async def run_sales_agent(
             await pool.open()
             logger.debug(f"[Session: {session_id}] PostgreSQL 连接池已打开")
             
-            # 创建 checkpointer
-            checkpointer = AsyncPostgresSaver(pool)
+            # 创建 checkpointer（配置序列化器允许自定义类型）
+            serde = JsonPlusSerializer(
+                allowed_msgpack_modules=[
+                    ("app.models.chat", "UserIntent"),
+                    ("app.models.chat", "IntentAnalysisResult"),
+                ]
+            )
+            checkpointer = AsyncPostgresSaver(pool, serde=serde)
             
             # 创建工作流并编译
             workflow = _create_workflow()
