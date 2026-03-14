@@ -78,6 +78,12 @@ class Settings(BaseSettings):
         description="项目根目录"
     )
     
+    # 数据库配置
+    database_url: Optional[str] = Field(
+        default=None, 
+        description="PostgreSQL 数据库连接 URL (用于 LangGraph 持久化)"
+    )
+    
     # 日志配置
     log_level: str = Field(default="INFO", description="日志级别")
     log_format: str = Field(

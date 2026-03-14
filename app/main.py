@@ -4,6 +4,7 @@ FastAPI 应用入口 - 智能销售 AI Agent 后端服务
 技术栈：
 - FastAPI (异步)
 - LangGraph (Agent 编排)
+- PostgreSQL (持久化存储)
 - Pydantic v2 (数据模型)
 - OpenAI (LLM)
 """
@@ -41,6 +42,22 @@ async def lifespan(app: FastAPI):
     # 确保输出目录存在
     os.makedirs(settings.output_dir, exist_ok=True)
     
+    # ═══ 初始化 PostgreSQL 数据库表（LangGraph 持久化）═══
+    if settings.database_url:
+        try:
+            from app.agents.graphs.sales_graph import initialize_database
+            logger.info("[Startup] 正在初始化 PostgreSQL 持久化...")
+            success = await initialize_database()
+            if success:
+                logger.info("[Startup] PostgreSQL 持久化初始化完成 ✓")
+            else:
+                logger.warning("[Startup] PostgreSQL 初始化失败，将使用内存存储")
+        except Exception as e:
+            logger.error(f"[Startup] PostgreSQL 初始化异常: {e}")
+            logger.warning("[Startup] 回退到内存存储（非持久化）")
+    else:
+        logger.warning("[Startup] 未配置 DATABASE_URL，使用内存存储（非持久化）")
+    
     # ═══ 初始化知识库（强制启动时初始化，修复懒加载问题）═══
     try:
         from app.agents.nodes.knowledge_node import kb_service
@@ -76,6 +93,7 @@ def create_application() -> FastAPI:
         ## 功能特性
         
         - 💬 智能对话：基于 LangGraph 的多轮对话
+        - 🔄 持久化记忆：PostgreSQL 存储跨会话上下文
         - 🔍 知识问答：RAG 检索增强的产品咨询
         - 📄 文档生成：报价单、提案书、合同、报表
         - 💰 销售辅助：价格谈判话术、投诉处理
@@ -85,6 +103,7 @@ def create_application() -> FastAPI:
         
         - FastAPI (异步框架)
         - LangGraph (Agent 工作流)
+        - PostgreSQL (持久化存储)
         - Pydantic v2 (数据验证)
         - OpenAI/Claude (大语言模型)
         """,
@@ -141,6 +160,7 @@ def create_application() -> FastAPI:
             "app": settings.app_name,
             "version": settings.app_version,
             "debug": settings.debug,
+            "persistent": settings.database_url is not None,
         }
     
     @app.get("/", tags=["根路径"])
@@ -151,6 +171,7 @@ def create_application() -> FastAPI:
             "version": settings.app_version,
             "docs": "/docs" if settings.debug else None,
             "api_prefix": settings.api_v1_prefix,
+            "persistent": settings.database_url is not None,
         }
     
     return app

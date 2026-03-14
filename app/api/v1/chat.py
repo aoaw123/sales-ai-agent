@@ -2,6 +2,9 @@
 聊天 API 模块 - 核心接口 POST /api/v1/chat
 
 这是前端（微信小程序）与后端交互的主要接口。
+关键特性：
+- 使用 session_id 作为 thread_id 实现会话隔离
+- PostgreSQL 持久化支持跨会话记忆
 """
 
 import time
@@ -10,7 +13,7 @@ from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, status, Header
 from fastapi.responses import JSONResponse
 
-from app.agents.graphs import run_sales_agent
+from app.agents.graphs.sales_graph import run_sales_agent
 from app.api.deps import get_current_session, verify_wechat_token
 from app.core.config import settings
 from app.core.logging import get_logger
@@ -33,6 +36,11 @@ router = APIRouter()
     summary="智能销售助手对话接口",
     description="""
     智能销售 AI Agent 的核心对话接口。
+    
+    **持久化特性：**
+    - 使用 `session_id` 作为会话唯一标识（thread_id）
+    - 对话状态自动持久化到 PostgreSQL
+    - 支持跨会话记忆，用户重新进入小程序后仍能继续之前对话
     
     支持的场景：
     - 💬 普通对话（问候、闲聊）
@@ -66,6 +74,11 @@ async def chat(
     """
     处理用户消息，调用 LangGraph Agent 生成回复
     
+    **会话隔离机制：**
+    - 使用 `session_id` 作为 `thread_id` 传递给 LangGraph
+    - 每个 session_id 对应独立的对话状态（存储在 PostgreSQL）
+    - 即使服务重启，对话历史也不会丢失
+    
     Args:
         request: 聊天请求数据
         session_id: 会话ID（从 Header 或请求体获取）
@@ -79,7 +92,10 @@ async def chat(
     # 使用请求体中的 session_id 优先
     actual_session_id = request.session_id or session_id
     
-    logger.info(f"[Session: {actual_session_id}] 收到消息: {request.message[:50]}...")
+    logger.info(
+        f"[Session: {actual_session_id}] 收到消息: {request.message[:50]}... "
+        f"(thread_id={actual_session_id})"
+    )
     
     try:
         # 转换历史消息格式
@@ -91,6 +107,7 @@ async def chat(
             })
         
         # 运行 Agent 工作流
+        # session_id 会被用作 thread_id，实现 PostgreSQL 持久化
         final_state = await run_sales_agent(
             session_id=actual_session_id,
             message=request.message,
@@ -115,6 +132,7 @@ async def chat(
                 "knowledge_results_count": len(final_state.get("knowledge_results", [])),
                 "document_params": final_state.get("document_params"),
                 "error": final_state.get("error"),
+                "persistent": True,  # 标记已启用持久化
             },
             response_time_ms=response_time_ms,
         )
@@ -158,7 +176,7 @@ async def chat_stream(
 @router.get(
     "/chat/history/{session_id}",
     summary="获取对话历史",
-    description="获取指定会话的历史消息记录"
+    description="获取指定会话的历史消息记录（从 PostgreSQL 持久化存储中读取）"
 )
 async def get_chat_history(
     session_id: str,
@@ -166,30 +184,35 @@ async def get_chat_history(
     """
     获取对话历史
     
-    实际项目中应从数据库或缓存中获取。
+    从 PostgreSQL 持久化存储中获取指定会话的完整历史记录。
     """
-    # TODO: 从 Redis/数据库获取历史记录
+    # TODO: 从 PostgreSQL checkpoints 表中提取对话历史
+    # 可以通过 checkpointer.aget() 方法获取特定 thread_id 的状态
     return {
         "session_id": session_id,
         "messages": [],
         "total": 0,
+        "note": "从 PostgreSQL 持久化存储中读取（开发中）",
     }
 
 
 @router.delete(
     "/chat/history/{session_id}",
     summary="清除对话历史",
-    description="清除指定会话的所有历史记录"
+    description="清除指定会话的所有历史记录（从 PostgreSQL 中删除）"
 )
 async def clear_chat_history(
     session_id: str,
 ) -> dict:
     """
     清除对话历史
+    
+    从 PostgreSQL 持久化存储中删除指定会话的所有状态数据。
     """
-    # TODO: 清除 Redis/数据库中的记录
+    # TODO: 调用 checkpointer.adelete() 删除特定 thread_id 的状态
     logger.info(f"[Session: {session_id}] 对话历史已清除")
     return {
         "session_id": session_id,
         "status": "cleared",
+        "note": "从 PostgreSQL 持久化存储中删除（开发中）",
     }

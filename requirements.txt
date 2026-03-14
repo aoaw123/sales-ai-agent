@@ -17,6 +17,10 @@ langchain-community>=0.0.10
 langchain-openai>=0.0.5
 langgraph>=0.0.40
 
+# ========== LangGraph PostgreSQL 持久化 ==========
+langgraph-checkpoint-postgres>=2.0.0
+psycopg>=3.2.0          # PostgreSQL 异步驱动（支持 async/await）
+
 # ========== LLM 支持 ==========
 openai>=1.10.0
 
@@ -35,8 +39,6 @@ reportlab>=4.0.0        # PDF 生成
 # ========== 数据库（可选） ==========
 # redis>=5.0.0          # 会话缓存
 # sqlalchemy>=2.0.0     # ORM
-# asyncpg>=0.29.0       # PostgreSQL 异步驱动
-# aiomysql>=0.2.0       # MySQL 异步驱动
 
 # ========== 工具库 ==========
 aiohttp>=3.9.0

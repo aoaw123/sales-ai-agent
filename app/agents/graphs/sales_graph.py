@@ -1,16 +1,20 @@
 """
-销售 AI Agent 主工作流图 - LangGraph 编排（重构版）
+销售 AI Agent 主工作流图 - LangGraph 编排（PostgreSQL 持久化版）
 
-重构要点：
-1. 彻底移除中断机制（interrupt_before/after）
-2. 极简流转逻辑：单向、无阻碍、一气呵成
-3. 彻底根除 tuple 越界：安全的状态提取
+更新要点：
+1. 使用 psycopg_pool.AsyncConnectionPool + AsyncPostgresSaver 实现持久化
+2. 显式管理连接池生命周期，避免 async_generator 协议问题
+3. 保留极简流转逻辑：单向、无阻碍、一气呵成
+4. 彻底根除 tuple 越界：安全的状态提取
 """
 
 from typing import Dict, Any, Optional, Union
 
 from langgraph.graph import StateGraph, END
+from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from langgraph.checkpoint.memory import MemorySaver
+from psycopg_pool import AsyncConnectionPool
+from psycopg import AsyncConnection
 
 from app.core.config import settings
 from app.core.logging import get_logger
@@ -33,41 +37,13 @@ from app.agents.nodes.response_node import (
 logger = get_logger("sales_graph")
 
 
-def create_sales_graph() -> StateGraph:
+def _create_workflow() -> StateGraph:
     """
-    创建销售 AI Agent 工作流图（极简无中断版）
-    
-    工作流结构（单向流转，无阻碍）：
-    
-                         ┌─────────────────┐
-                         │ intent_recognition│
-                         └────────┬────────┘
-                                  │
-                    ┌─────────────┼─────────────┐
-                    │             │             │
-                    ▼             ▼             ▼
-        ┌───────────────┐ ┌───────────────┐ ┌───────────────┐
-        │  knowledge    │ │ extract_doc   │ │    sales      │
-        │  _retrieval    │ │   _params     │ │  _response    │
-        └───────┬───────┘ └───────┬───────┘ └───────┬───────┘
-                │                 │                 │
-                ▼                 ▼                 │
-        ┌───────────────┐ ┌───────────────┐        │
-        │  knowledge    │ │  generate     │        │
-        │  _synthesis    │ │  _document    │        │
-        └───────┬───────┘ └───────┬───────┘        │
-                │                 │                │
-                └────────┬────────┘                │
-                         │                        │
-                         ▼                        ▼
-                    ┌─────────┐              ┌─────────┐
-                    │   END   │◄─────────────│   END   │
-                    └─────────┘              └─────────┘
+    创建工作流图结构（不含 checkpointer）
     
     Returns:
-        编译后的 StateGraph 实例
+        未编译的 StateGraph 实例
     """
-    
     # 创建工作流图
     workflow = StateGraph(SalesState)
     
@@ -138,22 +114,7 @@ def create_sales_graph() -> StateGraph:
     workflow.add_edge("sales_negotiation", END)
     workflow.add_edge("complaint_handler", END)
     
-    # ═══════════════════════════════════════════════════════════════
-    # 编译图（彻底移除中断机制）
-    # ═══════════════════════════════════════════════════════════════
-    
-    # 添加内存检查点（用于保存对话状态，但不断中断）
-    checkpointer = MemorySaver()
-    
-    compiled_graph = workflow.compile(
-        checkpointer=checkpointer,
-        # ❌ 移除：interrupt_before=["request_missing_params"]
-        # ❌ 移除：interrupt_after=[...]
-    )
-    
-    logger.info("销售 AI Agent 工作流图编译完成（极简无中断版）")
-    
-    return compiled_graph
+    return workflow
 
 
 def _route_by_next_node(state: SalesState) -> str:
@@ -192,14 +153,46 @@ def _route_by_knowledge_result(state: SalesState) -> str:
 
 
 # ═══════════════════════════════════════════════════════════════
-# 全局图实例
+# 向后兼容的同步 API（使用 MemorySaver）
 # ═══════════════════════════════════════════════════════════════
 
+def create_sales_graph():
+    """
+    创建销售 AI Agent 工作流图（同步版本，向后兼容）
+    
+    使用 MemorySaver 作为 checkpointer，适用于：
+    - 测试环境
+    - 不需要持久化的场景
+    - 向后兼容旧代码
+    
+    Returns:
+        编译后的 StateGraph 实例（使用 MemorySaver）
+    """
+    workflow = _create_workflow()
+    
+    # 使用内存存储（向后兼容）
+    checkpointer = MemorySaver()
+    compiled_graph = workflow.compile(checkpointer=checkpointer)
+    
+    logger.info("销售 AI Agent 工作流图编译完成（MemorySaver 版本）")
+    
+    return compiled_graph
+
+
+# 全局图实例（使用 MemorySaver，用于向后兼容）
 _sales_graph = None
 
 
 def get_sales_graph():
-    """获取销售图单例"""
+    """
+    获取销售图单例（同步版本，向后兼容）
+    
+    使用 MemorySaver，适用于测试和不需持久化的场景。
+    如果需要 PostgreSQL 持久化，请使用 run_sales_agent()。
+    
+    Returns:
+        编译后的 StateGraph 实例
+    """
     global _sales_graph
     if _sales_graph is None:
         _sales_graph = create_sales_graph()
@@ -207,8 +200,51 @@ def get_sales_graph():
 
 
 # ═══════════════════════════════════════════════════════════════
-# 安全的图执行函数（彻底根除 tuple 越界）
+# PostgreSQL 持久化 API（使用 psycopg_pool）
 # ═══════════════════════════════════════════════════════════════
+
+async def initialize_database() -> bool:
+    """
+    初始化数据库表结构
+    
+    在应用启动时调用，确保 LangGraph 所需的 checkpoints 表已创建。
+    绕过连接池，使用独占单次连接，强制开启 autocommit 建表，
+    以解决 CREATE INDEX CONCURRENTLY 不能在事务块内执行的问题。
+    
+    Returns:
+        初始化是否成功
+    """
+    if not settings.database_url:
+        logger.warning("[Init] 未配置 DATABASE_URL，跳过数据库初始化")
+        return False
+    
+    try:
+        logger.info("[Init] 正在初始化 PostgreSQL 数据库表...")
+        
+        # 绕过连接池，使用独占单次连接，强制开启 autocommit 建表
+        # 关键参数：
+        # - autocommit=True: 允许 CREATE INDEX CONCURRENTLY 执行
+        # - gssencmode="disable": 禁用 GSSAPI 加密，避免连接问题
+        conn = await AsyncConnection.connect(
+            settings.database_url,
+            autocommit=True,
+            gssencmode="disable",
+        )
+        try:
+            checkpointer = AsyncPostgresSaver(conn)
+            await checkpointer.setup()
+        finally:
+            await conn.close()
+        
+        logger.info("[Init] PostgreSQL 数据库表初始化完成 ✓")
+        return True
+        
+    except Exception as e:
+        logger.error(f"[Init] 数据库初始化失败: {e}")
+        import traceback
+        logger.debug(f"[Init] 错误详情: {traceback.format_exc()}")
+        return False
+
 
 async def run_sales_agent(
     session_id: str,
@@ -217,15 +253,17 @@ async def run_sales_agent(
     history: list = None
 ) -> Dict[str, Any]:
     """
-    运行销售 AI Agent（安全执行版）
+    运行销售 AI Agent（PostgreSQL 持久化版）
     
     关键保证：
-    1. 无论图怎么结束，都返回纯净 Dict
-    2. 绝不触发 tuple index out of range
-    3. 所有字段有兜底值
+    1. 使用 PostgreSQL 持久化对话状态（跨会话记忆）
+    2. 使用显式 AsyncConnectionPool 管理数据库连接
+    3. 无论图怎么结束，都返回纯净 Dict
+    4. 绝不触发 tuple index out of range
+    5. 所有字段有兜底值
     
     Args:
-        session_id: 会话唯一标识
+        session_id: 会话唯一标识（作为 thread_id 用于状态隔离）
         message: 用户消息
         context: 业务上下文
         history: 历史消息
@@ -233,8 +271,6 @@ async def run_sales_agent(
     Returns:
         最终状态字典（纯净 Dict，安全访问）
     """
-    graph = get_sales_graph()
-    
     # 创建初始状态
     initial_state = create_initial_state(
         session_id=session_id,
@@ -243,46 +279,99 @@ async def run_sales_agent(
         history=history
     )
     
-    # 配置
+    # 配置：关键！thread_id 用于会话隔离和持久化
     config = {
         "configurable": {"thread_id": session_id},
         "recursion_limit": settings.max_iterations,
     }
     
-    logger.info(f"[Session: {session_id}] 开始执行工作流")
+    logger.info(f"[Session: {session_id}] 开始执行工作流 (thread_id={session_id})")
     
     # ═══ 安全执行图并提取最终状态 ═══
     final_state: Dict[str, Any] = {}
     
-    try:
-        async for event in graph.astream(initial_state, config):
-            # event 是一个字典，key 是节点名，value 是状态
-            # 例如：{"intent_recognition": {...state...}}
+    # 如果没有配置数据库，回退到内存存储
+    if not settings.database_url:
+        logger.warning("[Session: {session_id}] 未配置 DATABASE_URL，使用 MemorySaver")
+        try:
+            workflow = _create_workflow()
+            checkpointer = MemorySaver()
+            graph = workflow.compile(checkpointer=checkpointer)
             
-            if not isinstance(event, dict):
-                logger.warning(f"[Graph] 非预期事件类型: {type(event)}")
-                continue
+            async for event in graph.astream(initial_state, config):
+                if not isinstance(event, dict):
+                    continue
+                for node_name, state_value in event.items():
+                    if isinstance(state_value, dict):
+                        final_state = state_value
+                    elif isinstance(state_value, (list, tuple)) and len(state_value) > 0:
+                        first_item = state_value[0]
+                        if isinstance(first_item, dict):
+                            final_state = first_item
             
-            for node_name, state_value in event.items():
-                logger.debug(f"[Graph] 节点 {node_name} 执行完成")
-                
-                # 安全提取状态（处理各种可能的类型）
-                if isinstance(state_value, dict):
-                    final_state = state_value
-                elif isinstance(state_value, (list, tuple)) and len(state_value) > 0:
-                    # 如果是列表/元组，取第一个元素
-                    first_item = state_value[0]
-                    if isinstance(first_item, dict):
-                        final_state = first_item
-                    else:
-                        logger.warning(f"[Graph] 非预期的状态类型在列表中: {type(first_item)}")
-                else:
-                    logger.warning(f"[Graph] 非预期的状态类型: {type(state_value)}")
+            logger.info(f"[Session: {session_id}] 工作流执行完成（内存模式）")
+            
+        except Exception as e:
+            logger.error(f"[Graph] 工作流执行异常: {e}")
+            final_state = {
+                "session_id": session_id,
+                "sales_response": "抱歉，处理您的请求时出现了问题。请稍后重试。",
+                "suggested_actions": ["重新尝试", "联系客服"],
+                "error": str(e),
+            }
         
-        logger.info(f"[Session: {session_id}] 工作流执行完成")
+        final_state = _sanitize_final_state(final_state, session_id)
+        return final_state
+    
+    # ═══ 使用 PostgreSQL 持久化执行 ═══
+    try:
+        # 创建显式连接池
+        async with AsyncConnectionPool(
+            conninfo=settings.database_url,
+            max_size=20,
+            open=False,
+        ) as pool:
+            await pool.open()
+            logger.debug(f"[Session: {session_id}] PostgreSQL 连接池已打开")
+            
+            # 创建 checkpointer
+            checkpointer = AsyncPostgresSaver(pool)
+            
+            # 创建工作流并编译
+            workflow = _create_workflow()
+            graph = workflow.compile(checkpointer=checkpointer)
+            
+            # 执行工作流
+            async for event in graph.astream(initial_state, config):
+                # event 是一个字典，key 是节点名，value 是状态
+                # 例如：{"intent_recognition": {...state...}}
+                
+                if not isinstance(event, dict):
+                    logger.warning(f"[Graph] 非预期事件类型: {type(event)}")
+                    continue
+                
+                for node_name, state_value in event.items():
+                    logger.debug(f"[Graph] 节点 {node_name} 执行完成")
+                    
+                    # 安全提取状态（处理各种可能的类型）
+                    if isinstance(state_value, dict):
+                        final_state = state_value
+                    elif isinstance(state_value, (list, tuple)) and len(state_value) > 0:
+                        # 如果是列表/元组，取第一个元素
+                        first_item = state_value[0]
+                        if isinstance(first_item, dict):
+                            final_state = first_item
+                        else:
+                            logger.warning(f"[Graph] 非预期的状态类型在列表中: {type(first_item)}")
+                    else:
+                        logger.warning(f"[Graph] 非预期的状态类型: {type(state_value)}")
+            
+            logger.info(f"[Session: {session_id}] 工作流执行完成（PostgreSQL 持久化）")
         
     except Exception as e:
         logger.error(f"[Graph] 工作流执行异常: {e}")
+        import traceback
+        logger.debug(f"[Graph] 错误详情: {traceback.format_exc()}")
         # 执行失败也返回兜底状态
         final_state = {
             "session_id": session_id,
