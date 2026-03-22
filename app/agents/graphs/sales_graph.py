@@ -226,10 +226,12 @@ async def initialize_database() -> bool:
         # 关键参数：
         # - autocommit=True: 允许 CREATE INDEX CONCURRENTLY 执行
         # - gssencmode="disable": 禁用 GSSAPI 加密，避免连接问题
+        # - prepare_threshold=0: 禁用 prepared statement 缓存（解决 Supabase 连接池冲突）
         conn = await AsyncConnection.connect(
             settings.database_url,
             autocommit=True,
             gssencmode="disable",
+            prepare_threshold=0,
         )
         try:
             # 配置序列化器，允许反序列化 app.models.chat 模块中的自定义类型
@@ -332,12 +334,16 @@ async def run_sales_agent(
         return final_state
     
     # ═══ 使用 PostgreSQL 持久化执行 ═══
+    
     try:
         # 创建显式连接池
+        # 关键：使用 kwargs 传递 prepare_threshold=None 禁用 prepared statement 缓存
         async with AsyncConnectionPool(
             conninfo=settings.database_url,
             max_size=20,
+            min_size=1,
             open=False,
+            kwargs={"prepare_threshold": None},  # ← 关键：禁用 prepared statement
         ) as pool:
             await pool.open()
             logger.debug(f"[Session: {session_id}] PostgreSQL 连接池已打开")
