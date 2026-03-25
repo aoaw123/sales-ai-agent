@@ -41,6 +41,15 @@ async def lifespan(app: FastAPI):
     # 确保输出目录存在
     os.makedirs(settings.output_dir, exist_ok=True)
     
+    # ═══ 初始化 PostgreSQL 数据库表 ═══
+    if settings.database_url:
+        from app.agents.graphs.sales_graph import initialize_database
+        success = await initialize_database()
+        if success:
+            logger.info("[Startup] PostgreSQL 持久化初始化完成 ✓")
+        else:
+            logger.warning("[Startup] PostgreSQL 初始化失败，将使用内存存储")
+    
     # ═══ 初始化知识库（强制启动时初始化，修复懒加载问题）═══
     try:
         from app.agents.nodes.knowledge_node import kb_service
@@ -141,6 +150,7 @@ def create_application() -> FastAPI:
             "app": settings.app_name,
             "version": settings.app_version,
             "debug": settings.debug,
+            "persistent": bool(settings.database_url),
         }
     
     @app.get("/", tags=["根路径"])

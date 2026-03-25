@@ -32,11 +32,12 @@ pypdf>=4.0.0            # PDF 处理
 pdfplumber>=0.10.0      # PDF 内容提取
 reportlab>=4.0.0        # PDF 生成
 
-# ========== 数据库（可选） ==========
-# redis>=5.0.0          # 会话缓存
-# sqlalchemy>=2.0.0     # ORM
-# asyncpg>=0.29.0       # PostgreSQL 异步驱动
-# aiomysql>=0.2.0       # MySQL 异步驱动
+# ========== 数据库 ==========
+# PostgreSQL 持久化（LangGraph checkpointer）
+psycopg[binary]>=3.1.0      # PostgreSQL 异步驱动
+psycopg-pool>=3.1.0         # PostgreSQL 连接池
+# redis>=5.0.0              # 会话缓存（预留）
+# sqlalchemy>=2.0.0         # ORM（预留）
 
 # ========== 工具库 ==========
 aiohttp>=3.9.0

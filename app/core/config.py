@@ -56,6 +56,12 @@ class Settings(BaseSettings):
     # LangGraph 配置
     max_iterations: int = Field(default=10, description="最大迭代次数，防止死循环")
     
+    # PostgreSQL 数据库配置（持久化）
+    database_url: Optional[str] = Field(
+        default=None,
+        description="PostgreSQL 连接字符串（用于 LangGraph 状态持久化）"
+    )
+    
     # 知识库配置
     knowledge_base_path: str = Field(
         default="./data/knowledge_base",
